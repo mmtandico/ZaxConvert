@@ -2,6 +2,7 @@ package com.zaxconvert.command;
 
 import com.zaxconvert.ZaxConvert;
 import com.zaxconvert.conversion.ResourcePackConverter;
+import com.zaxconvert.util.Gradient;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.command.Command;
@@ -65,10 +66,28 @@ public class ZaxConvertCommand implements CommandExecutor {
             sender.sendMessage(ChatColor.RED + "You don't have permission to convert resource packs.");
             return true;
         }
-        sender.sendMessage(ChatColor.GOLD + "Scanning providers and converting packs...");
+        sender.sendMessage(Gradient.title("Scanning..."));
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () ->
-                report(sender, converter.convertAllProviders()));
+                report(sender, converter.convertAllProviders(listener(sender))));
         return true;
+    }
+
+    private java.util.function.BiConsumer<String, String> listener(CommandSender sender) {
+        return (level, msg) -> {
+            switch (level) {
+                case "warn":
+                    sender.sendMessage(Gradient.warn(msg));
+                    break;
+                case "error":
+                    sender.sendMessage(Gradient.error(msg));
+                    break;
+                case "success":
+                    sender.sendMessage(Gradient.success(msg));
+                    break;
+                default:
+                    sender.sendMessage(Gradient.info(msg));
+            }
+        };
     }
 
     private boolean handleConvert(CommandSender sender, String[] args) {
@@ -91,23 +110,29 @@ public class ZaxConvertCommand implements CommandExecutor {
             return true;
         }
         String name = pack.getName().replaceAll("\\.zip$", "");
-        sender.sendMessage(ChatColor.GOLD + "Converting " + pack.getName() + "...");
+        sender.sendMessage(Gradient.title("Converting " + pack.getName() + "..."));
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () ->
-                report(sender, java.util.Collections.singletonList(converter.convertPack(name, pack))));
+                report(sender, java.util.Collections.singletonList(
+                        converter.convertPack(name, pack, listener(sender)))));
         return true;
     }
 
     private void report(CommandSender sender, java.util.List<ResourcePackConverter.Result> results) {
         boolean any = false;
         for (ResourcePackConverter.Result r : results) {
-            ChatColor c = r.success ? ChatColor.GREEN : ChatColor.YELLOW;
-            sender.sendMessage(c + "[" + r.provider + "] " + r.message);
+            if (r.success) {
+                sender.sendMessage(Gradient.success("\u2714 " + r.provider + ": " + r.message));
+            } else {
+                sender.sendMessage(Gradient.warn("\u2716 " + r.provider + ": " + r.message));
+            }
             any |= r.success;
         }
         if (any) {
-            sender.sendMessage(ChatColor.GREEN + "Done! Restart the server (or Geyser) so Bedrock players get the new pack.");
+            sender.sendMessage(Gradient.title("Conversion complete!"));
+            sender.sendMessage(Gradient.info("Files: plugins/ZaxConvert/generated (auto-installed to Geyser)"));
+            sender.sendMessage(Gradient.info("Restart the server or Geyser so Bedrock players receive the new pack."));
         } else {
-            sender.sendMessage(ChatColor.RED + "Nothing was converted.");
+            sender.sendMessage(Gradient.error("Nothing was converted."));
         }
     }
 

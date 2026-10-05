@@ -6,7 +6,9 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.GsonBuilder;
 import com.zaxconvert.ZaxConvert;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
 
 import java.awt.image.BufferedImage;
 import java.io.*;
@@ -16,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
+import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -23,11 +26,14 @@ import java.util.zip.ZipOutputStream;
 
 /**
  * Converts Java resource packs (Nexo / ItemsAdder / Oraxen) into a Bedrock
- * .mcpack plus a Geyser custom item mappings file.
+ * .mcpack plus a Geyser custom item mappings file (format_version: 2).
  *
- * Items are converted from "custom_model_data" overrides in
- * assets/minecraft/models/item/*.json. Each override becomes a Geyser custom
- * item whose icon is the model's 2D texture.
+ * Full support for:
+ * - 3D models with proper hand placement and swing physics
+ * - Custom wearable armor with body layers (helmet, chestplate, leggings, boots)
+ * - 2D item extrusion and natural handheld positioning via geometry.item_default
+ * - Animated textures (flipbook)
+ * - Full inventory icons registered into Bedrock's vanilla atlas
  */
 public class ResourcePackConverter {
 
@@ -44,6 +50,10 @@ public class ResourcePackConverter {
         public final String provider;
         public boolean success;
         public int items;
+        public int models3d;
+        public int animated;
+        public int armors;
+        public int skipped;
         public String message = "";
         public File mcpack;
         public File mappings;
@@ -53,68 +63,184 @@ public class ResourcePackConverter {
         }
     }
 
-    /** Scans all enabled providers and converts whatever is found. */
-    public List<Result> convertAllProviders() {
-        List<Result> results = new ArrayList<>();
-        File pluginsDir = plugin.getDataFolder().getParentFile();
-        for (String provider : new String[]{"nexo", "itemsadder", "oraxen"}) {
-            if (!config.getBoolean("plugin-support." + provider + "-enabled", true)) {
-                continue;
+    /** Receives (level, message) where level is info/success/warn/error. */
+    private BiConsumer<String, String> progress;
+    private Map<String, String> modelIndex = new HashMap<>();
+    private Map<String, String> texIndex = new HashMap<>();
+    private final Map<String, TexInfo> textureCache = new HashMap<>();
+    private final Map<String, Model> modelCache = new HashMap<>();
+
+    private void say(String level, String msg) {
+        plugin.getLogger().info("[" + level + "] " + msg);
+        if (progress != null) {
+            try {
+                progress.accept(level, msg);
+            } catch (Exception ignored) {
             }
-            File pack = findProviderPack(pluginsDir, provider);
-            if (pack == null) {
-                Result r = new Result(provider);
-                r.message = "No pack found (provider not installed or pack not generated yet)";
-                results.add(r);
-                continue;
-            }
-            results.add(convertPack(provider, pack));
         }
-        return results;
+    }
+
+    public List<Result> convertAllProviders() {
+        return convertAllProviders(null);
+    }
+
+    /** Scans all enabled providers and converts whatever is found. */
+    public synchronized List<Result> convertAllProviders(BiConsumer<String, String> listener) {
+        this.progress = listener;
+        try {
+            List<Result> results = new ArrayList<>();
+            File pluginsDir = plugin.getDataFolder().getParentFile();
+            say("info", "Scanning providers (Nexo, ItemsAdder, Oraxen)...");
+            for (String provider : new String[]{"nexo", "itemsadder", "oraxen"}) {
+                if (!config.getBoolean("plugin-support." + provider + "-enabled", true)) {
+                    continue;
+                }
+                File pack = findProviderPack(pluginsDir, provider);
+                if (pack == null) {
+                    Result r = new Result(provider);
+                    r.message = "No pack found (provider not installed or pack not generated yet)";
+                    say("warn", provider + ": " + r.message);
+                    results.add(r);
+                    continue;
+                }
+                say("info", "Found " + provider + " pack: " + pack.getName());
+                results.add(doConvert(provider, pack));
+            }
+            return results;
+        } finally {
+            this.progress = null;
+        }
+    }
+
+    public Result convertPack(String name, File pack) {
+        return convertPack(name, pack, null);
     }
 
     /** Converts one manually specified pack (zip or folder). */
-    public Result convertPack(String name, File pack) {
+    public synchronized Result convertPack(String name, File pack, BiConsumer<String, String> listener) {
+        this.progress = listener;
+        try {
+            return doConvert(name, pack);
+        } finally {
+            this.progress = null;
+        }
+    }
+
+    private Result doConvert(String name, File pack) {
         Result result = new Result(name);
-        plugin.getLogger().info("Converting '" + name + "' from " + pack.getPath());
+        say("info", "Reading " + name + " models, textures, and armors...");
+
         try (PackSource src = PackSource.open(pack)) {
             File outDir = new File(plugin.getDataFolder(), "generated");
             outDir.mkdirs();
+            textureCache.clear();
+            modelCache.clear();
+
+            // Build case-insensitive indexes for all models and textures
+            modelIndex = buildModelIndex(src);
+            texIndex = buildTextureIndex(src);
+
             Map<String, byte[]> bedrockFiles = new LinkedHashMap<>();
             JsonObject mappingItems = new JsonObject();
             Set<String> usedNames = new HashSet<>();
             JsonObject textureData = new JsonObject();
             JsonArray flipbooks = new JsonArray();
+            StringBuilder langFile = new StringBuilder();
             boolean want3d = config.getBoolean("conversion.convert-3d-models", true);
+
+            // Add standard item default render controller and disable animation (required by Bedrock attachables)
+            bedrockFiles.put("render_controllers/item_default.render_controllers.json", BedrockAnimationBuilder.buildDefaultRenderController());
+            bedrockFiles.put("render_controllers/armor.render_controllers.json", BedrockAnimationBuilder.buildArmorRenderControllers());
+            bedrockFiles.put("animations/zaxconvert.disable.animation.json", BedrockAnimationBuilder.buildDisableAnimation());
 
             int count = 0;
             int models3d = 0;
             int animated = 0;
-            for (ItemDef def : collectDefinitions(src)) {
-                try {
-                    Model model = resolveModel(src, def.modelId);
-                    String itemName = uniqueName(usedNames, name + "_" + def.modelId);
+            int armors = 0;
 
-                    // Icon texture: 2D layer0 or the first texture of the model
-                    String iconRef = null;
-                    if (model.textures.containsKey("layer0")) {
-                        iconRef = resolveRef(model.textures, "#layer0");
+            for (ItemDef def : collectDefinitions(src, name)) {
+                try {
+                    String targetModelId = def.definition ? resolveDefModelId(src, def.modelId) : def.modelId;
+                    Model model = resolveModel(src, targetModelId);
+                    String itemName = uniqueName(usedNames, "smc_" + hash7(name + "|" + def.key()));
+
+                    boolean isHandheld = isHandheldItem(def.baseItem, def.modelId, def.displayName);
+                    String armorSlot = getArmorSlot(def.baseItem, def.modelId, def.displayName);
+                    boolean isArmor = (armorSlot != null);
+                    if (isArmor && (def.baseItem == null || !def.baseItem.endsWith(armorSlot))) {
+                        def.baseItem = "chainmail_" + armorSlot;
                     }
-                    if (iconRef == null) {
-                        for (String key : model.textures.keySet()) {
-                            iconRef = resolveRef(model.textures, "#" + key);
-                            if (iconRef != null && src.exists(texturePath(iconRef))) break;
-                            iconRef = null;
+
+                    // Icon: 3D models are rendered like the Java GUI; flat models use their layers
+                    byte[] iconPng = null;
+                    TexInfo icon = null;
+                    Map<String, TexInfo> texByRef = null;
+                    boolean has3d = model.elements != null && !model.elements.isEmpty();
+
+                    if (has3d) {
+                        texByRef = gatherTextures(src, model);
+                        iconPng = renderIcon(model, texByRef);
+                    }
+                    if (iconPng == null) {
+                        icon = loadFlatIcon(src, model);
+                        if (icon != null) iconPng = icon.png;
+                    }
+                    if (iconPng == null && texByRef != null && !texByRef.isEmpty()) {
+                        TexInfo firstTex = texByRef.values().iterator().next();
+                        if (firstTex != null) {
+                            icon = firstTex;
+                            iconPng = firstTex.png;
                         }
                     }
-                    TexInfo icon = iconRef == null ? null : loadTexture(src, iconRef);
-                    if (icon == null) continue;
+                    if (iconPng == null) {
+                        // Direct O(1) search by modelId
+                        String clean = def.modelId.substring(Math.max(def.modelId.lastIndexOf(':'), def.modelId.lastIndexOf('/')) + 1).toLowerCase(Locale.ROOT);
+                        String path = texIndex.get("textures/item/" + clean + ".png");
+                        if (path == null) path = texIndex.get("textures/items/" + clean + ".png");
+                        if (path == null) path = texIndex.get(clean + ".png");
+                        if (path == null) path = texIndex.get(clean);
+                        if (path != null) {
+                            icon = loadTexture(src, path);
+                            if (icon != null) iconPng = icon.png;
+                        }
+                    }
+                    if (iconPng == null && isArmor && def.armorTexture != null) {
+                        String clean = def.armorTexture.toLowerCase(Locale.ROOT);
+                        String path = texIndex.get("textures/item/" + clean + "_" + armorSlot + ".png");
+                        if (path == null) path = texIndex.get("textures/items/" + clean + "_" + armorSlot + ".png");
+                        if (path == null) path = texIndex.get("textures/item/" + clean + ".png");
+                        if (path == null) path = texIndex.get(clean + "_" + armorSlot + ".png");
+                        if (path == null) path = texIndex.get(clean + ".png");
+                        if (path == null) path = texIndex.get(clean);
+                        if (path != null) {
+                            icon = loadTexture(src, path);
+                            if (icon != null) iconPng = icon.png;
+                        }
+                    }
+                    if (iconPng == null && isArmor) {
+                        String path = texIndex.get("textures/items/chainmail_" + armorSlot + ".png");
+                        if (path == null) path = texIndex.get("textures/item/chainmail_" + armorSlot + ".png");
+                        if (path == null) path = texIndex.get("chainmail_" + armorSlot + ".png");
+                        if (path != null) {
+                            icon = loadTexture(src, path);
+                            if (icon != null) iconPng = icon.png;
+                        }
+                    }
+                    if (iconPng == null) {
+                        result.skipped++;
+                        if (result.skipped <= 5) {
+                            say("warn", "No usable texture for model " + def.modelId + " (skipped)");
+                        }
+                        continue;
+                    }
 
-                    bedrockFiles.put("textures/items/" + itemName + ".png", icon.png);
+                    // Save icon texture
+                    bedrockFiles.put("textures/items/" + itemName + ".png", iconPng);
                     JsonObject td = new JsonObject();
                     td.addProperty("textures", "textures/items/" + itemName);
                     textureData.add(itemName, td);
-                    if (icon.frames > 1) {
+
+                    if (icon != null && icon.frames > 1) {
                         JsonObject fb = new JsonObject();
                         fb.addProperty("flipbook_texture", "textures/items/" + itemName);
                         fb.addProperty("atlas_tile", itemName);
@@ -128,35 +254,85 @@ public class ResourcePackConverter {
                         animated++;
                     }
 
-                    if (want3d && model.elements != null && !model.elements.isEmpty()
-                            && build3d(src, itemName, model, bedrockFiles)) {
+                    if (isArmor) {
+                        if (ArmorConverter.processArmor(src, def, itemName, armorSlot, texIndex, bedrockFiles)) {
+                            armors++;
+                        }
+                    } else if (want3d && has3d && BedrockModelBuilder.build3d(itemName, model, texByRef, isHandheld, bedrockFiles)) {
                         models3d++;
                     }
+                    // Note: Flat 2D items (tools, swords, materials) do NOT require an attachable file.
+                    // Minecraft Bedrock's native item rendering automatically extrudes the 2D icon in hand,
+                    // respects display_handheld for tool swinging, and floats/rotates the item when dropped.
 
+                    // Mapping entry matching smcconverter format_version 2
                     JsonObject entry = new JsonObject();
-                    entry.addProperty("name", itemName);
-                    entry.addProperty("custom_model_data", def.cmd);
-                    entry.addProperty("icon", itemName);
-                    entry.addProperty("allow_offhand", true);
+                    entry.addProperty("type", def.definition ? "definition" : "legacy");
+                    if (def.definition) {
+                        entry.addProperty("model", def.modelId);
+                    } else {
+                        entry.addProperty("custom_model_data", def.cmd);
+                    }
+                    entry.addProperty("bedrock_identifier", "s_mc:" + itemName);
+                    entry.addProperty("display_name", def.displayName);
+                    JsonObject bedrockOptions = new JsonObject();
+                    bedrockOptions.addProperty("icon", itemName);
+                    bedrockOptions.addProperty("allow_offhand", true);
+
+                    if (isHandheld) {
+                        bedrockOptions.addProperty("display_handheld", true);
+                    }
+                    if (isArmor) {
+                        bedrockOptions.addProperty("creative_category", "equipment");
+                        int prot = "chestplate".equals(armorSlot) ? 8 : "leggings".equals(armorSlot) ? 6 : 3;
+                        bedrockOptions.addProperty("protection_value", prot);
+                        bedrockOptions.addProperty("creative_group", "itemGroup.name." + armorSlot);
+                    } else if (isHandheld) {
+                        bedrockOptions.addProperty("creative_category", "equipment");
+                    }
+                    entry.add("bedrock_options", bedrockOptions);
+
                     if (!mappingItems.has("minecraft:" + def.baseItem)) {
                         mappingItems.add("minecraft:" + def.baseItem, new JsonArray());
                     }
                     mappingItems.getAsJsonArray("minecraft:" + def.baseItem).add(entry);
+
+                    // Add translation for Bedrock item hover tooltip
+                    langFile.append("item.s_mc:").append(itemName).append(".name=")
+                            .append(def.displayName).append("\n");
+
                     count++;
                 } catch (Exception ex) {
+                    result.skipped++;
                     plugin.getLogger().warning("Skipped model " + def.modelId + ": " + ex);
                 }
             }
 
             if (count == 0) {
-                result.message = "No custom_model_data items found in pack";
+                result.message = "No custom items found in pack";
                 return result;
             }
+
             if (flipbooks.size() > 0) {
                 bedrockFiles.put("textures/flipbook_textures.json", toBytes(flipbooks));
             }
-            plugin.getLogger().info(name + ": " + count + " items, " + models3d + " 3D models, "
-                    + animated + " animated icons");
+
+            // Language files
+            bedrockFiles.put("texts/en_US.lang", langFile.toString().getBytes(StandardCharsets.UTF_8));
+            JsonArray langs = new JsonArray();
+            langs.add("en_US");
+            bedrockFiles.put("texts/languages.json", toBytes(langs));
+
+            // Render controllers for all attachables (items, tools, armor)
+            bedrockFiles.put("render_controllers/item_default.render_controllers.json", BedrockAnimationBuilder.buildDefaultRenderController());
+            bedrockFiles.put("render_controllers/armor.render_controllers.json", BedrockAnimationBuilder.buildArmorRenderControllers());
+
+            result.models3d = models3d;
+            result.animated = animated;
+            result.armors = armors;
+            say("info", name + ": " + count + " items (" + models3d + " 3D, " + armors + " armors, "
+                    + animated + " animated, " + result.skipped + " skipped)");
+            say("info", "Packaging " + name + " for Bedrock...");
 
             // Bedrock pack metadata
             UUID headerId = UUID.nameUUIDFromBytes(("zaxconvert-header-" + name).getBytes(StandardCharsets.UTF_8));
@@ -179,6 +355,7 @@ public class ResourcePackConverter {
             manifest.add("modules", modules);
             bedrockFiles.put("manifest.json", toBytes(manifest));
 
+            // Item texture atlas definition for Bedrock
             JsonObject itemTexture = new JsonObject();
             itemTexture.addProperty("resource_pack_name", "zaxconvert_" + name);
             itemTexture.addProperty("texture_name", "atlas.items");
@@ -197,7 +374,7 @@ public class ResourcePackConverter {
 
             // Write Geyser mappings
             JsonObject mappings = new JsonObject();
-            mappings.addProperty("format_version", 1);
+            mappings.addProperty("format_version", 2);
             mappings.add("items", mappingItems);
             File mappingsFile = new File(outDir, "zaxconvert_" + name + ".json");
             Files.write(mappingsFile.toPath(), toBytes(mappings));
@@ -206,7 +383,8 @@ public class ResourcePackConverter {
             result.mappings = mappingsFile;
             result.items = count;
             result.success = true;
-            result.message = count + " items converted";
+            result.message = count + " items (" + models3d + " 3D, " + armors + " armors, "
+                    + animated + " animated, " + result.skipped + " skipped)";
 
             if (config.getBoolean("geyser.auto-place-files", true)) {
                 placeInGeyser(result);
@@ -259,57 +437,233 @@ public class ResourcePackConverter {
         return null;
     }
 
-    /** Follows a model (and its parents) to find a 2D texture file path inside the pack. */
-    private String resolveTexture(PackSource src, String modelId) {
-        String current = modelId;
-        for (int depth = 0; depth < 5 && current != null; depth++) {
-            JsonObject model = readJson(src, modelPath(current));
-            if (model == null) return null;
-            if (model.has("textures") && model.get("textures").isJsonObject()) {
-                JsonObject tex = model.getAsJsonObject("textures");
-                String ref = null;
-                if (tex.has("layer0")) {
-                    ref = tex.get("layer0").getAsString();
-                } else {
-                    for (Map.Entry<String, JsonElement> e : tex.entrySet()) {
-                        if (e.getValue().isJsonPrimitive() && !e.getValue().getAsString().startsWith("#")) {
-                            ref = e.getValue().getAsString();
-                            break;
-                        }
-                    }
-                }
-                if (ref != null && !ref.startsWith("#")) {
-                    String path = texturePath(ref);
-                    if (src.exists(path)) return path;
-                }
-            }
-            current = model.has("parent") ? model.get("parent").getAsString() : null;
-        }
-        return null;
-    }
-
     // ------------------------------------------------------------------
     // Item definitions, models, textures
     // ------------------------------------------------------------------
 
-    private static class ItemDef {
-        final String baseItem;
-        final int cmd;
+    static class ItemDef {
+        String baseItem;
+        final Integer cmd;
         final String modelId;
+        final boolean definition;
+        String displayName;
+        String armorTexture;
 
-        ItemDef(String baseItem, int cmd, String modelId) {
+        ItemDef(String baseItem, Integer cmd, String modelId, boolean definition, String displayName, String armorTexture) {
             this.baseItem = baseItem;
             this.cmd = cmd;
             this.modelId = modelId;
+            this.definition = definition;
+            this.displayName = displayName;
+            this.armorTexture = armorTexture;
+        }
+
+        String key() {
+            return definition ? "def#" + modelId : baseItem + "#" + cmd;
         }
     }
 
-    private static class Model {
-        List<JsonObject> elements;
-        final Map<String, String> textures = new LinkedHashMap<>();
+    private static String getArmorSlot(String baseItem) {
+        return getArmorSlot(baseItem, null, null);
     }
 
-    private static class TexInfo {
+    private static String getArmorSlot(String baseItem, String modelId, String name) {
+        String s = ((baseItem == null ? "" : baseItem) + " "
+                + (modelId == null ? "" : modelId) + " "
+                + (name == null ? "" : name)).toLowerCase(Locale.ROOT);
+        if (s.contains("furniture") || s.contains("block/") || s.contains("statue") || s.contains("trophy")) {
+            return null;
+        }
+        if (s.contains("helmet") || s.contains("cap") || s.contains("hood") || s.contains("crown")) return "helmet";
+        if (s.contains("chestplate") || s.contains("tunic") || s.contains("jacket") || s.contains("shirt") || s.contains("robe")) return "chestplate";
+        if (s.contains("leggings") || s.contains("pants")) return "leggings";
+        if (s.contains("boots") || s.contains("shoes")) return "boots";
+        return null;
+    }
+
+    private static boolean isHandheldItem(String baseItem, String modelId, String name) {
+        String lower = ((baseItem == null ? "" : baseItem) + " "
+                + (modelId == null ? "" : modelId) + " "
+                + (name == null ? "" : name)).toLowerCase(Locale.ROOT);
+        if (lower.contains("furniture") || lower.contains("block/")) return false;
+        return lower.contains("sword") || lower.contains("pickaxe") || lower.contains("axe")
+                || lower.contains("shovel") || lower.contains("hoe") || lower.contains("mace")
+                || lower.contains("trident") || lower.contains("blade") || lower.contains("dagger")
+                || lower.contains("spear") || lower.contains("staff") || lower.contains("wand")
+                || lower.contains("hammer") || lower.contains("scythe") || lower.contains("halberd")
+                || lower.contains("katana") || lower.contains("saber") || lower.contains("bow")
+                || lower.contains("crossbow") || lower.contains("rod") || lower.contains("shears")
+                || lower.contains("brush") || lower.contains("tool") || lower.contains("weapon");
+    }
+
+    private static String titleCase(String id) {
+        String last = id.substring(Math.max(id.lastIndexOf('/'), id.lastIndexOf(':')) + 1).replace('_', ' ');
+        StringBuilder sb = new StringBuilder();
+        for (String w : last.split(" ")) {
+            if (w.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(Character.toUpperCase(w.charAt(0))).append(w.substring(1));
+        }
+        return sb.toString();
+    }
+
+    private static String cleanName(String raw) {
+        return raw.replaceAll("(?i)[\u00a7&][0-9a-fk-or]", "").replaceAll("<[^>]+>", "").trim();
+    }
+
+    private static String hash7(String s) {
+        return UUID.nameUUIDFromBytes(s.getBytes(StandardCharsets.UTF_8)).toString().replace("-", "").substring(0, 7);
+    }
+
+    /** Resolves an item definition id (ns:name) to the model it points at; falls back to the id itself. */
+    private String resolveDefModelId(PackSource src, String id) {
+        String path = findDefPath(src, id);
+        if (path != null) {
+            JsonObject root = readJson(src, path);
+            if (root != null && root.has("model")) {
+                String m = anyModelId(root.get("model"));
+                if (m != null) return m;
+            }
+        }
+        return id;
+    }
+
+    /** Depth-first search for the first plain model reference in an item definition tree. */
+    private String anyModelId(JsonElement el) {
+        if (el == null) return null;
+        if (el.isJsonArray()) {
+            for (JsonElement e : el.getAsJsonArray()) {
+                String r = anyModelId(e);
+                if (r != null) return r;
+            }
+            return null;
+        }
+        if (!el.isJsonObject()) return null;
+        JsonObject o = el.getAsJsonObject();
+        String type = o.has("type") ? o.get("type").getAsString().replace("minecraft:", "") : "";
+        if (type.equals("model") && o.has("model")) return o.get("model").getAsString();
+        for (String key : new String[]{"model", "fallback", "on_false", "on_true", "cases", "entries"}) {
+            if (o.has(key)) {
+                String r = anyModelId(o.get(key));
+                if (r != null) return r;
+            }
+        }
+        return null;
+    }
+
+    /** Reads Nexo / ItemsAdder / Oraxen item configs: material, display name, model, custom_model_data, armor. */
+    private void readProviderItems(String provider, PackSource src, List<ItemDef> defs, Set<String> seen,
+                                   Map<String, String> cmdNames) {
+        File pluginsDir = plugin.getDataFolder().getParentFile();
+        List<File> searchDirs = new ArrayList<>();
+        if (provider.equals("nexo")) {
+            searchDirs.add(new File(pluginsDir, "Nexo/items"));
+            searchDirs.add(new File(pluginsDir, "nexo/items"));
+        } else if (provider.equals("oraxen")) {
+            searchDirs.add(new File(pluginsDir, "Oraxen/items"));
+            searchDirs.add(new File(pluginsDir, "oraxen/items"));
+        } else if (provider.equals("itemsadder")) {
+            searchDirs.add(new File(pluginsDir, "ItemsAdder/contents"));
+            searchDirs.add(new File(pluginsDir, "ItemsAdder/data"));
+            searchDirs.add(new File(pluginsDir, "itemsadder/contents"));
+            searchDirs.add(new File(pluginsDir, "itemsadder/data"));
+        }
+
+        List<File> files = new ArrayList<>();
+        for (File dir : searchDirs) {
+            if (!dir.isDirectory()) continue;
+            try (Stream<Path> s = Files.walk(dir.toPath())) {
+                s.filter(p -> p.toString().endsWith(".yml")).forEach(p -> files.add(p.toFile()));
+            } catch (IOException ignored) {}
+        }
+        if (files.isEmpty()) return;
+
+        for (File f : files) {
+            YamlConfiguration y;
+            try {
+                y = YamlConfiguration.loadConfiguration(f);
+            } catch (Exception ignored) {
+                continue;
+            }
+
+            // Items can be at root or under "items" section
+            ConfigurationSection itemsSec = y.getConfigurationSection("items");
+            Set<String> itemKeys = itemsSec != null ? itemsSec.getKeys(false) : y.getKeys(false);
+
+            for (String key : itemKeys) {
+                ConfigurationSection sec = itemsSec != null ? itemsSec.getConfigurationSection(key) : y.getConfigurationSection(key);
+                if (sec == null) continue;
+
+                String material = sec.getString("material", sec.getString("resource.material"));
+                String slot = getArmorSlot(material, key, null);
+
+                // If material is missing or not armor, but key indicates armor, use appropriate vanilla base
+                if (material == null && slot != null) {
+                    material = "chainmail_" + slot;
+                } else if (material == null) {
+                    continue;
+                }
+                String base = material.toLowerCase(Locale.ROOT);
+                if (slot != null && !base.endsWith(slot)) {
+                    base = "chainmail_" + slot;
+                }
+
+                ConfigurationSection pack = sec.getConfigurationSection("Pack");
+                if (pack == null) pack = sec.getConfigurationSection("pack");
+
+                String model = sec.getString("model", sec.getString("resource.model_path",
+                        sec.getString("resource.model", sec.getString("item_model"))));
+                if (model == null && pack != null) {
+                    model = pack.getString("model", pack.getString("item_model"));
+                }
+                if (model == null) model = key;
+
+                Integer cmd = null;
+                if (pack != null && pack.contains("custom_model_data")) cmd = pack.getInt("custom_model_data");
+                if (cmd == null && sec.contains("custom_model_data")) cmd = sec.getInt("custom_model_data");
+                if (cmd == null && sec.contains("resource.model_id")) cmd = sec.getInt("resource.model_id");
+
+                String rawName = sec.getString("display_name", sec.getString("itemname", sec.getString("displayname")));
+                String name = rawName != null ? cleanName(rawName) : titleCase(key);
+                if (name.isEmpty()) name = titleCase(key);
+
+                // Detect armor texture
+                String armorTex = sec.getString("armor.texture", sec.getString("armor_texture", sec.getString("resource.armor_texture")));
+                if (armorTex == null && pack != null) {
+                    armorTex = pack.getString("armor_texture", pack.getString("armor.texture"));
+                }
+                if (armorTex == null && slot != null) {
+                    armorTex = key.replace("_helmet", "").replace("_chestplate", "")
+                            .replace("_leggings", "").replace("_boots", "");
+                }
+
+                String id = model.contains(":") ? model : provider + ":" + model;
+                boolean hasDef = (findDefPath(src, id) != null);
+                boolean hasModel = (findModelPath(src, id) != null);
+
+                if (hasDef || (!hasModel && cmd == null)) {
+                    ItemDef d = new ItemDef(base, null, id, true, name, armorTex);
+                    if (seen.add(d.key())) defs.add(d);
+                } else if (cmd != null) {
+                    ItemDef d = new ItemDef(base, cmd, id, false, name, armorTex);
+                    if (seen.add(d.key())) defs.add(d);
+                    cmdNames.put(base + "#" + cmd, name);
+                } else {
+                    ItemDef d = new ItemDef(base, null, id, true, name, armorTex);
+                    if (seen.add(d.key())) defs.add(d);
+                }
+            }
+        }
+    }
+
+    static class Model {
+        List<JsonObject> elements;
+        final Map<String, String> textures = new LinkedHashMap<>();
+        final Map<String, JsonObject> display = new HashMap<>();
+        String guiLight = null;
+    }
+
+    static class TexInfo {
         byte[] png;
         BufferedImage img;
         int fw, fh, frames = 1, ticks = 1;
@@ -317,9 +671,13 @@ public class ResourcePackConverter {
     }
 
     /** Collects custom_model_data entries from legacy overrides and 1.21.4 item definitions. */
-    private List<ItemDef> collectDefinitions(PackSource src) throws IOException {
+    private List<ItemDef> collectDefinitions(PackSource src, String provider) throws IOException {
         List<ItemDef> defs = new ArrayList<>();
         Set<String> seen = new HashSet<>();
+        Map<String, String> cmdNames = new HashMap<>();
+
+        // Provider configs first: they know the real base material and display name
+        readProviderItems(provider, src, defs, seen, cmdNames);
 
         // Legacy: assets/minecraft/models/item/<base>.json overrides
         for (String path : src.list("assets/minecraft/models/item/", ".json")) {
@@ -331,9 +689,26 @@ public class ResourcePackConverter {
                 if (!ov.has("predicate") || !ov.has("model")) continue;
                 JsonObject pred = ov.getAsJsonObject("predicate");
                 if (!pred.has("custom_model_data")) continue;
+                // Skip transient secondary animation states (e.g. shield blocking, bow pulling)
+                // so the primary resting model is registered for the item and its GUI icon
+                if (pred.has("blocking") && pred.get("blocking").getAsDouble() > 0) continue;
+                if (pred.has("pulling") && pred.get("pulling").getAsDouble() > 0) continue;
+                if (pred.has("pull") && pred.get("pull").getAsDouble() > 0) continue;
+
                 int cmd = (int) pred.get("custom_model_data").getAsDouble();
+                String mId = ov.get("model").getAsString();
+                String armorTex = null;
+                String slot = getArmorSlot(base, mId, null);
+                if (slot != null) {
+                    armorTex = mId.substring(Math.max(mId.lastIndexOf('/'), mId.lastIndexOf(':')) + 1)
+                            .replace("_helmet", "").replace("_chestplate", "")
+                            .replace("_leggings", "").replace("_boots", "");
+                    if (getArmorSlot(base) == null) {
+                        base = "chainmail_" + slot;
+                    }
+                }
                 if (seen.add(base + "#" + cmd)) {
-                    defs.add(new ItemDef(base, cmd, ov.get("model").getAsString()));
+                    defs.add(new ItemDef(base, cmd, mId, false, null, armorTex));
                 }
             }
         }
@@ -344,6 +719,35 @@ public class ResourcePackConverter {
             if (root == null || !root.has("model")) continue;
             String base = path.substring(path.lastIndexOf('/') + 1, path.length() - 5);
             walkItemModel(root.get("model"), base, defs, seen);
+        }
+
+        // Item definitions of custom namespaces (item_model component), e.g. assets/nexo/items/foo.json
+        Set<String> definedModels = new HashSet<>();
+        for (ItemDef d : defs) {
+            if (d.definition) definedModels.add(d.modelId);
+        }
+        for (String path : src.list("assets/", ".json")) {
+            String[] parts = path.split("/");
+            if (parts.length < 4 || !parts[2].equals("items") || parts[1].equals("minecraft")) continue;
+            String rel = path.substring(("assets/" + parts[1] + "/items/").length(), path.length() - 5);
+            String id = parts[1] + ":" + rel;
+            if (definedModels.contains(id)) continue;
+            String base = "paper";
+            String armorTex = null;
+            String slot = getArmorSlot(null, rel, null);
+            if (slot != null) {
+                base = "chainmail_" + slot;
+                armorTex = rel.substring(Math.max(rel.lastIndexOf('/'), rel.lastIndexOf(':')) + 1)
+                        .replace("_helmet", "").replace("_chestplate", "")
+                        .replace("_leggings", "").replace("_boots", "");
+            }
+            ItemDef d = new ItemDef(base, null, id, true, null, armorTex);
+            if (seen.add(d.key())) defs.add(d);
+        }
+
+        for (ItemDef d : defs) {
+            if (d.displayName == null && !d.definition) d.displayName = cmdNames.get(d.key());
+            if (d.displayName == null) d.displayName = titleCase(d.modelId);
         }
         return defs;
     }
@@ -361,12 +765,24 @@ public class ResourcePackConverter {
                 if (!entry.has("threshold") || !entry.has("model")) continue;
                 int cmd = (int) entry.get("threshold").getAsDouble();
                 String modelId = firstModelId(entry.get("model"));
-                if (modelId != null && seen.add(base + "#" + cmd)) {
-                    defs.add(new ItemDef(base, cmd, modelId));
+                if (modelId != null) {
+                    String effBase = base;
+                    String armorTex = null;
+                    String slot = getArmorSlot(effBase, modelId, null);
+                    if (slot != null) {
+                        armorTex = modelId.substring(Math.max(modelId.lastIndexOf('/'), modelId.lastIndexOf(':')) + 1)
+                                .replace("_helmet", "").replace("_chestplate", "")
+                                .replace("_leggings", "").replace("_boots", "");
+                        if (getArmorSlot(effBase) == null) {
+                            effBase = "chainmail_" + slot;
+                        }
+                    }
+                    if (seen.add(effBase + "#" + cmd)) {
+                        defs.add(new ItemDef(effBase, cmd, modelId, false, null, armorTex));
+                    }
                 }
             }
         }
-        // Descend into nested models (conditions, selects, fallbacks)
         for (String key : new String[]{"fallback", "on_true", "on_false"}) {
             if (o.has(key)) walkItemModel(o.get(key), base, defs, seen);
         }
@@ -395,13 +811,18 @@ public class ResourcePackConverter {
     }
 
     private Model resolveModel(PackSource src, String modelId) {
+        if (modelId == null) return new Model();
+        if (modelCache.containsKey(modelId)) {
+            return modelCache.get(modelId);
+        }
         Model m = new Model();
         String cur = modelId;
         for (int depth = 0; depth < 10 && cur != null; depth++) {
             String plain = cur.replace("minecraft:", "");
-            JsonObject json = readJson(src, modelPath(cur));
+            String path = findModelPath(src, cur);
+            JsonObject json = (path != null) ? readJson(src, path) : null;
+
             if (json == null) {
-                // Vanilla parents that are not shipped in the pack
                 if (m.elements == null) {
                     if (plain.equals("block/cube_all")) {
                         m.elements = Collections.singletonList(cubeElement("#all", "#all", "#all", "#all", "#all", "#all"));
@@ -418,6 +839,14 @@ public class ResourcePackConverter {
                     if (e.getValue().isJsonPrimitive()) m.textures.putIfAbsent(e.getKey(), e.getValue().getAsString());
                 }
             }
+            if (json.has("display") && json.get("display").isJsonObject()) {
+                for (Map.Entry<String, JsonElement> e : json.getAsJsonObject("display").entrySet()) {
+                    if (e.getValue().isJsonObject()) m.display.putIfAbsent(e.getKey(), e.getValue().getAsJsonObject());
+                }
+            }
+            if (m.guiLight == null && json.has("gui_light")) {
+                m.guiLight = json.get("gui_light").getAsString();
+            }
             if (m.elements == null && json.has("elements") && json.get("elements").isJsonArray()) {
                 m.elements = new ArrayList<>();
                 for (JsonElement el : json.getAsJsonArray("elements")) {
@@ -426,6 +855,7 @@ public class ResourcePackConverter {
             }
             cur = json.has("parent") ? json.get("parent").getAsString() : null;
         }
+        modelCache.put(modelId, m);
         return m;
     }
 
@@ -444,6 +874,190 @@ public class ResourcePackConverter {
         return el;
     }
 
+    static String resolveRefPublic(Map<String, String> textures, String ref) {
+        return resolveRef(textures, ref);
+    }
+
+    /** Index of model paths in pack for instant lookup across namespaces and subfolders. */
+    private Map<String, String> buildModelIndex(PackSource src) {
+        Map<String, String> idx = new HashMap<>();
+        for (String p : src.list("assets/", ".json")) {
+            String[] parts = p.split("/");
+            if (parts.length >= 4 && parts[2].equals("models")) {
+                String ns = parts[1].toLowerCase(Locale.ROOT);
+                String sub = p.substring(("assets/" + parts[1] + "/models/").length(), p.length() - 5).toLowerCase(Locale.ROOT);
+                idx.putIfAbsent(ns + ":" + sub, p);
+                idx.putIfAbsent(sub, p);
+                if (sub.startsWith("item/")) {
+                    idx.putIfAbsent(ns + ":" + sub.substring(5), p);
+                    idx.putIfAbsent(sub.substring(5), p);
+                } else if (sub.startsWith("block/")) {
+                    idx.putIfAbsent(ns + ":" + sub.substring(6), p);
+                    idx.putIfAbsent(sub.substring(6), p);
+                } else {
+                    idx.putIfAbsent(ns + ":item/" + sub, p);
+                    idx.putIfAbsent(ns + ":block/" + sub, p);
+                }
+            }
+        }
+        return idx;
+    }
+
+    /** Index of texture paths in pack for instant lookup. */
+    private Map<String, String> buildTextureIndex(PackSource src) {
+        Map<String, String> idx = new HashMap<>();
+        for (String p : src.list("assets/", ".png")) {
+            String[] parts = p.split("/");
+            String fileName = parts[parts.length - 1].toLowerCase(Locale.ROOT);
+            String simpleName = fileName.endsWith(".png") ? fileName.substring(0, fileName.length() - 4) : fileName;
+            idx.putIfAbsent(fileName, p);
+            idx.putIfAbsent(simpleName, p);
+
+            if (parts.length >= 4 && parts[2].equals("textures")) {
+                String ns = parts[1].toLowerCase(Locale.ROOT);
+                String sub = p.substring(("assets/" + parts[1] + "/textures/").length(), p.length() - 4).toLowerCase(Locale.ROOT);
+                idx.putIfAbsent(ns + ":" + sub, p);
+                idx.putIfAbsent(sub, p);
+                idx.putIfAbsent(ns + ":" + sub + ".png", p);
+                idx.putIfAbsent(sub + ".png", p);
+                if (sub.startsWith("item/")) {
+                    idx.putIfAbsent(ns + ":" + sub.substring(5), p);
+                    idx.putIfAbsent(sub.substring(5), p);
+                    idx.putIfAbsent("textures/item/" + simpleName + ".png", p);
+                    idx.putIfAbsent("textures/items/" + simpleName + ".png", p);
+                } else if (sub.startsWith("block/")) {
+                    idx.putIfAbsent(ns + ":" + sub.substring(6), p);
+                    idx.putIfAbsent(sub.substring(6), p);
+                    idx.putIfAbsent("textures/block/" + simpleName + ".png", p);
+                    idx.putIfAbsent("textures/blocks/" + simpleName + ".png", p);
+                }
+                idx.putIfAbsent("textures/" + sub + ".png", p);
+            }
+        }
+        return idx;
+    }
+
+    private String findModelPath(PackSource src, String id) {
+        if (id == null) return null;
+        String clean = id.toLowerCase(Locale.ROOT);
+        String found = modelIndex.get(clean);
+        if (found != null && src.exists(found)) return found;
+
+        String[] s = split(id);
+        String[] candidates = {
+                "assets/" + s[0] + "/models/" + s[1] + ".json",
+                "assets/" + s[0] + "/models/item/" + s[1] + ".json",
+                "assets/" + s[0] + "/models/block/" + s[1] + ".json",
+                "assets/" + s[0] + "/models/furniture/" + s[1] + ".json",
+                "assets/" + s[0] + "/models/custom/" + s[1] + ".json"
+        };
+        for (String c : candidates) {
+            if (src.exists(c)) return c;
+        }
+        return null;
+    }
+
+    private String findDefPath(PackSource src, String id) {
+        if (id == null) return null;
+        String[] s = split(id);
+        String c = "assets/" + s[0] + "/items/" + s[1] + ".json";
+        return src.exists(c) ? c : null;
+    }
+
+    /** Loads every distinct texture referenced by the model faces. */
+    private Map<String, TexInfo> gatherTextures(PackSource src, Model model) throws IOException {
+        Map<String, TexInfo> texByRef = new LinkedHashMap<>();
+        for (JsonObject el : model.elements) {
+            if (!el.has("faces")) continue;
+            for (Map.Entry<String, JsonElement> fe : el.getAsJsonObject("faces").entrySet()) {
+                JsonObject face = fe.getValue().getAsJsonObject();
+                if (!face.has("texture")) continue;
+                String ref = resolveRef(model.textures, face.get("texture").getAsString());
+                if (ref == null || texByRef.containsKey(ref)) continue;
+                TexInfo t = loadTexture(src, ref);
+                if (t != null) texByRef.put(ref, t);
+            }
+        }
+        return texByRef;
+    }
+
+    /** Renders a 3D model to a PNG icon using its display.gui transform. */
+    private byte[] renderIcon(Model model, Map<String, TexInfo> texByRef) throws IOException {
+        if (texByRef.isEmpty()) return null;
+        Map<String, BufferedImage> frames = new HashMap<>();
+        for (Map.Entry<String, TexInfo> e : texByRef.entrySet()) {
+            TexInfo t = e.getValue();
+            frames.put(e.getKey(), t.img.getSubimage(0, 0, Math.min(t.fw, t.img.getWidth()), Math.min(t.fh, t.img.getHeight())));
+        }
+        int size = Math.max(16, Math.min(256, config.getInt("conversion.icon-size", 64)));
+        BufferedImage img = ModelRenderer.render(model.elements, model.textures, frames,
+                model.display.get("gui"), "front".equals(model.guiLight), size);
+        if (img == null) return null;
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        ImageIO.write(img, "png", bos);
+        return bos.toByteArray();
+    }
+
+    /** Flat (builtin/generated) icon: layer0..N composited, or the first usable texture. */
+    private TexInfo loadFlatIcon(PackSource src, Model model) throws IOException {
+        List<String> layerKeys = new ArrayList<>();
+        for (String k : model.textures.keySet()) {
+            if (k.startsWith("layer")) layerKeys.add(k);
+        }
+        layerKeys.sort(Comparator.comparing(k -> {
+            try {
+                return Integer.parseInt(k.substring(5));
+            } catch (NumberFormatException e) {
+                return 99;
+            }
+        }));
+        List<TexInfo> layers = new ArrayList<>();
+        for (String k : layerKeys) {
+            String ref = resolveRef(model.textures, "#" + k);
+            TexInfo t = ref == null ? null : loadTexture(src, ref);
+            if (t != null) layers.add(t);
+        }
+        if (layers.isEmpty()) {
+            for (String k : model.textures.keySet()) {
+                if (k.equals("particle")) continue;
+                String ref = resolveRef(model.textures, "#" + k);
+                TexInfo t = ref == null ? null : loadTexture(src, ref);
+                if (t != null) {
+                    layers.add(t);
+                    break;
+                }
+            }
+        }
+        if (layers.isEmpty() && model.textures.containsKey("particle")) {
+            String ref = resolveRef(model.textures, "#particle");
+            TexInfo t = ref == null ? null : loadTexture(src, ref);
+            if (t != null) layers.add(t);
+        }
+        if (layers.isEmpty()) return null;
+        if (layers.size() == 1) return layers.get(0);
+
+        int maxW = 0, maxH = 0;
+        for (TexInfo t : layers) {
+            maxW = Math.max(maxW, t.fw);
+            maxH = Math.max(maxH, t.fh);
+        }
+        BufferedImage out = new BufferedImage(maxW, maxH, BufferedImage.TYPE_INT_ARGB);
+        java.awt.Graphics2D g = out.createGraphics();
+        g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION, java.awt.RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+        for (TexInfo t : layers) {
+            g.drawImage(t.img.getSubimage(0, 0, t.fw, t.fh), 0, 0, maxW, maxH, null);
+        }
+        g.dispose();
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        ImageIO.write(out, "png", bos);
+        TexInfo res = new TexInfo();
+        res.png = bos.toByteArray();
+        res.img = out;
+        res.fw = maxW;
+        res.fh = maxH;
+        return res;
+    }
+
     private static String resolveRef(Map<String, String> textures, String ref) {
         for (int i = 0; i < 10 && ref != null; i++) {
             if (!ref.startsWith("#")) return ref;
@@ -454,11 +1068,24 @@ public class ResourcePackConverter {
 
     /** Loads a PNG and its optional .mcmeta animation info. */
     private TexInfo loadTexture(PackSource src, String ref) throws IOException {
-        String path = texturePath(ref);
+        if (ref == null) return null;
+        String clean = ref.toLowerCase(Locale.ROOT);
+        if (textureCache.containsKey(clean)) {
+            return textureCache.get(clean);
+        }
+        String path = texIndex.get(clean);
+        if (path == null) path = texturePath(ref);
+        if (!src.exists(path)) {
+            String[] parts = split(ref);
+            path = texIndex.get("textures/" + parts[1].toLowerCase(Locale.ROOT) + ".png");
+        }
+        if (path == null || !src.exists(path)) return null;
+
         byte[] png = src.read(path);
         if (png == null) return null;
         BufferedImage img = ImageIO.read(new ByteArrayInputStream(png));
         if (img == null) return null;
+
         TexInfo t = new TexInfo();
         t.png = png;
         t.img = img;
@@ -473,6 +1100,7 @@ public class ResourcePackConverter {
             if (t.fw <= 0 || t.fh <= 0 || t.fh > img.getHeight() || t.fw > img.getWidth()) {
                 t.fw = img.getWidth();
                 t.fh = img.getHeight();
+                textureCache.put(clean, t);
                 return t;
             }
             t.frames = Math.max(1, img.getHeight() / t.fh);
@@ -491,218 +1119,15 @@ public class ResourcePackConverter {
                 }
             }
         }
+        textureCache.put(clean, t);
         return t;
     }
 
     // ------------------------------------------------------------------
-    // 3D: Java model -> Bedrock geometry + attachable
+    // Math, JSON, and Pack Source Utilities
     // ------------------------------------------------------------------
 
-    private boolean build3d(PackSource src, String itemName, Model model, Map<String, byte[]> out) throws IOException {
-        // Gather the distinct textures used by faces
-        Map<String, TexInfo> texByRef = new LinkedHashMap<>();
-        for (JsonObject el : model.elements) {
-            if (!el.has("faces")) continue;
-            for (Map.Entry<String, JsonElement> fe : el.getAsJsonObject("faces").entrySet()) {
-                JsonObject face = fe.getValue().getAsJsonObject();
-                if (!face.has("texture")) continue;
-                String ref = resolveRef(model.textures, face.get("texture").getAsString());
-                if (ref == null || texByRef.containsKey(ref)) continue;
-                TexInfo t = loadTexture(src, ref);
-                if (t != null) texByRef.put(ref, t);
-            }
-        }
-        if (texByRef.isEmpty()) return false;
-
-        // Texture layout: single texture is used as-is (keeps animation); several are stacked into an atlas
-        Map<String, int[]> layout = new HashMap<>(); // ref -> {yOffset, frameW, frameH}
-        int atlasW;
-        int atlasH;
-        TexInfo animatedTex = null;
-        byte[] textureBytes;
-        if (texByRef.size() == 1) {
-            TexInfo t = texByRef.values().iterator().next();
-            layout.put(texByRef.keySet().iterator().next(), new int[]{0, t.fw, t.fh});
-            atlasW = t.fw;
-            atlasH = t.fh;
-            textureBytes = t.png;
-            if (t.frames > 1) animatedTex = t;
-        } else {
-            atlasW = 0;
-            atlasH = 0;
-            for (TexInfo t : texByRef.values()) {
-                atlasW = Math.max(atlasW, t.fw);
-                atlasH += t.fh;
-            }
-            BufferedImage atlas = new BufferedImage(atlasW, atlasH, BufferedImage.TYPE_INT_ARGB);
-            int y = 0;
-            for (Map.Entry<String, TexInfo> e : texByRef.entrySet()) {
-                TexInfo t = e.getValue();
-                atlas.getGraphics().drawImage(t.img.getSubimage(0, 0, t.fw, t.fh), 0, y, null);
-                layout.put(e.getKey(), new int[]{y, t.fw, t.fh});
-                y += t.fh;
-            }
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            ImageIO.write(atlas, "png", bos);
-            textureBytes = bos.toByteArray();
-        }
-
-        // Cubes. Java x is mirrored for Bedrock: x' = 8 - x, z' = z - 8
-        JsonArray cubes = new JsonArray();
-        for (JsonObject el : model.elements) {
-            if (!el.has("from") || !el.has("to") || !el.has("faces")) continue;
-            double[] from = doubles(el.getAsJsonArray("from"));
-            double[] to = doubles(el.getAsJsonArray("to"));
-            JsonObject cube = new JsonObject();
-            cube.add("origin", dblArray(8 - to[0], from[1], from[2] - 8));
-            cube.add("size", dblArray(to[0] - from[0], to[1] - from[1], to[2] - from[2]));
-
-            if (el.has("rotation") && el.get("rotation").isJsonObject()) {
-                JsonObject rot = el.getAsJsonObject("rotation");
-                double angle = rot.has("angle") ? rot.get("angle").getAsDouble() : 0;
-                String axis = rot.has("axis") ? rot.get("axis").getAsString() : "y";
-                double[] o = rot.has("origin") ? doubles(rot.getAsJsonArray("origin")) : new double[]{8, 8, 8};
-                cube.add("pivot", dblArray(8 - o[0], o[1], o[2] - 8));
-                switch (axis) {
-                    case "x":
-                        cube.add("rotation", dblArray(angle, 0, 0));
-                        break;
-                    case "y":
-                        cube.add("rotation", dblArray(0, -angle, 0));
-                        break;
-                    default:
-                        cube.add("rotation", dblArray(0, 0, -angle));
-                }
-            }
-
-            JsonObject uvs = new JsonObject();
-            for (Map.Entry<String, JsonElement> fe : el.getAsJsonObject("faces").entrySet()) {
-                String dir = fe.getKey();
-                JsonObject face = fe.getValue().getAsJsonObject();
-                if (!face.has("texture")) continue;
-                String ref = resolveRef(model.textures, face.get("texture").getAsString());
-                int[] lay = ref == null ? null : layout.get(ref);
-                if (lay == null) continue;
-
-                double[] uv;
-                if (face.has("uv")) {
-                    uv = doubles(face.getAsJsonArray("uv"));
-                } else {
-                    switch (dir) {
-                        case "north":
-                        case "south":
-                            uv = new double[]{from[0], 16 - to[1], to[0], 16 - from[1]};
-                            break;
-                        case "east":
-                        case "west":
-                            uv = new double[]{from[2], 16 - to[1], to[2], 16 - from[1]};
-                            break;
-                        default:
-                            uv = new double[]{from[0], from[2], to[0], to[2]};
-                    }
-                }
-                double sx = lay[1] / 16.0;
-                double sy = lay[2] / 16.0;
-                double u1 = uv[0] * sx, v1 = lay[0] + uv[1] * sy;
-                double u2 = uv[2] * sx, v2 = lay[0] + uv[3] * sy;
-
-                // X mirror: swap east/west and flip horizontally
-                String bedrockDir = dir.equals("east") ? "west" : dir.equals("west") ? "east" : dir;
-                JsonObject f = new JsonObject();
-                f.add("uv", dblArray(u2, v1));
-                f.add("uv_size", dblArray(-(u2 - u1), v2 - v1));
-                uvs.add(bedrockDir, f);
-            }
-            cube.add("uv", uvs);
-            cubes.add(cube);
-        }
-        if (cubes.size() == 0) return false;
-
-        String geoId = "geometry.zaxconvert." + itemName;
-        JsonObject bone = new JsonObject();
-        bone.addProperty("name", "item");
-        bone.add("pivot", intArray(0, 0, 0));
-        bone.add("cubes", cubes);
-        JsonArray bones = new JsonArray();
-        bones.add(bone);
-        JsonObject desc = new JsonObject();
-        desc.addProperty("identifier", geoId);
-        desc.addProperty("texture_width", atlasW);
-        desc.addProperty("texture_height", atlasH);
-        desc.addProperty("visible_bounds_width", 4);
-        desc.addProperty("visible_bounds_height", 4);
-        desc.add("visible_bounds_offset", intArray(0, 1, 0));
-        JsonObject geo = new JsonObject();
-        geo.add("description", desc);
-        geo.add("bones", bones);
-        JsonArray geoArr = new JsonArray();
-        geoArr.add(geo);
-        JsonObject geoRoot = new JsonObject();
-        geoRoot.addProperty("format_version", "1.12.0");
-        geoRoot.add("minecraft:geometry", geoArr);
-        out.put("models/entity/" + itemName + ".geo.json", toBytes(geoRoot));
-        out.put("textures/zaxconvert/" + itemName + ".png", textureBytes);
-
-        // Render controller (animated textures use uv_anim to step through frames)
-        String controller = "controller.render.item_default";
-        if (animatedTex != null) {
-            controller = "controller.render.zaxconvert_" + itemName;
-            int frames = animatedTex.frames;
-            JsonObject rc = new JsonObject();
-            rc.addProperty("geometry", "Geometry.default");
-            JsonArray mats = new JsonArray();
-            JsonObject mat = new JsonObject();
-            mat.addProperty("*", "Material.default");
-            mats.add(mat);
-            rc.add("materials", mats);
-            JsonArray texs = new JsonArray();
-            texs.add("Texture.default");
-            rc.add("textures", texs);
-            JsonObject uvAnim = new JsonObject();
-            JsonArray offset = new JsonArray();
-            offset.add("0.0");
-            offset.add("math.floor(query.life_time * 20 / " + animatedTex.ticks + ") / " + frames);
-            uvAnim.add("offset", offset);
-            JsonArray scale = new JsonArray();
-            scale.add("1.0");
-            scale.add(String.valueOf(1.0 / frames));
-            uvAnim.add("scale", scale);
-            rc.add("uv_anim", uvAnim);
-            JsonObject controllers = new JsonObject();
-            controllers.add(controller, rc);
-            JsonObject rcRoot = new JsonObject();
-            rcRoot.addProperty("format_version", "1.10.0");
-            rcRoot.add("render_controllers", controllers);
-            out.put("render_controllers/" + itemName + ".render_controllers.json", toBytes(rcRoot));
-        }
-
-        // Attachable (Geyser custom items use the geyser_custom: namespace)
-        JsonObject aDesc = new JsonObject();
-        aDesc.addProperty("identifier", "geyser_custom:" + itemName);
-        JsonObject materials = new JsonObject();
-        materials.addProperty("default", "entity_alphatest");
-        materials.addProperty("enchanted", "entity_alphatest_glint");
-        aDesc.add("materials", materials);
-        JsonObject aTex = new JsonObject();
-        aTex.addProperty("default", "textures/zaxconvert/" + itemName);
-        aTex.addProperty("enchanted", "textures/misc/enchanted_item_glint");
-        aDesc.add("textures", aTex);
-        JsonObject aGeo = new JsonObject();
-        aGeo.addProperty("default", geoId);
-        aDesc.add("geometry", aGeo);
-        JsonArray rcs = new JsonArray();
-        rcs.add(controller);
-        aDesc.add("render_controllers", rcs);
-        JsonObject att = new JsonObject();
-        att.add("description", aDesc);
-        JsonObject attRoot = new JsonObject();
-        attRoot.addProperty("format_version", "1.10.0");
-        attRoot.add("minecraft:attachable", att);
-        out.put("attachables/" + itemName + ".json", toBytes(attRoot));
-        return true;
-    }
-
-    private static double[] doubles(JsonArray a) {
+    static double[] doubles(JsonArray a) {
         double[] d = new double[a.size()];
         for (int i = 0; i < d.length; i++) d[i] = a.get(i).getAsDouble();
         return d;
@@ -717,11 +1142,6 @@ public class ResourcePackConverter {
     private static String[] split(String id) {
         int i = id.indexOf(':');
         return i < 0 ? new String[]{"minecraft", id} : new String[]{id.substring(0, i), id.substring(i + 1)};
-    }
-
-    private static String modelPath(String id) {
-        String[] s = split(id);
-        return "assets/" + s[0] + "/models/" + s[1] + ".json";
     }
 
     private static String texturePath(String id) {
@@ -745,7 +1165,7 @@ public class ResourcePackConverter {
         return a;
     }
 
-    private static byte[] toBytes(JsonElement o) {
+    static byte[] toBytes(JsonElement o) {
         return new GsonBuilder().setPrettyPrinting().create().toJson(o).getBytes(StandardCharsets.UTF_8);
     }
 
@@ -770,7 +1190,7 @@ public class ResourcePackConverter {
     // Pack sources (zip or folder)
     // ------------------------------------------------------------------
 
-    private interface PackSource extends Closeable {
+    interface PackSource extends Closeable {
         byte[] read(String path) throws IOException;
 
         boolean exists(String path);
@@ -819,13 +1239,21 @@ public class ResourcePackConverter {
 
     private static class ZipSource implements PackSource {
         private final ZipFile zip;
+        private final Map<String, ZipEntry> entryMap = new HashMap<>();
 
         ZipSource(ZipFile zip) {
             this.zip = zip;
+            Enumeration<? extends ZipEntry> en = zip.entries();
+            while (en.hasMoreElements()) {
+                ZipEntry e = en.nextElement();
+                String name = e.getName().replace('\\', '/').toLowerCase(Locale.ROOT);
+                entryMap.putIfAbsent(name, e);
+            }
         }
 
         public byte[] read(String path) throws IOException {
-            ZipEntry e = zip.getEntry(path);
+            String clean = path.replace('\\', '/').toLowerCase(Locale.ROOT);
+            ZipEntry e = entryMap.get(clean);
             if (e == null) return null;
             try (InputStream in = zip.getInputStream(e)) {
                 return in.readAllBytes();
@@ -833,16 +1261,19 @@ public class ResourcePackConverter {
         }
 
         public boolean exists(String path) {
-            return zip.getEntry(path) != null;
+            String clean = path.replace('\\', '/').toLowerCase(Locale.ROOT);
+            return entryMap.containsKey(clean);
         }
 
         public List<String> list(String prefix, String suffix) {
             List<String> out = new ArrayList<>();
-            Enumeration<? extends ZipEntry> en = zip.entries();
-            while (en.hasMoreElements()) {
-                ZipEntry e = en.nextElement();
-                String n = e.getName();
-                if (!e.isDirectory() && n.startsWith(prefix) && n.endsWith(suffix)) out.add(n);
+            String cleanPrefix = prefix.toLowerCase(Locale.ROOT);
+            String cleanSuffix = suffix.toLowerCase(Locale.ROOT);
+            for (Map.Entry<String, ZipEntry> e : entryMap.entrySet()) {
+                String k = e.getKey();
+                if (!e.getValue().isDirectory() && k.startsWith(cleanPrefix) && k.endsWith(cleanSuffix)) {
+                    out.add(e.getValue().getName());
+                }
             }
             return out;
         }

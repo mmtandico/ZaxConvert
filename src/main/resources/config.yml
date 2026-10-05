@@ -29,6 +29,18 @@ plugin-support:
   # Auto-detect and configure supported plugins
   auto-configure-plugins: true
 
+  # Candidate pack locations per provider (relative to the server's plugins folder).
+  # Zips are preferred over folders; the first one that exists is used.
+  paths:
+    nexo:
+      - "Nexo/pack/pack.zip"
+      - "Nexo/pack"
+    itemsadder:
+      - "ItemsAdder/output/generated.zip"
+    oraxen:
+      - "Oraxen/pack/pack.zip"
+      - "Oraxen/pack"
+
 # Conversion Settings
 conversion:
   # Maximum file size for conversion (in MB)
@@ -45,6 +57,9 @@ conversion:
 
 # Geyser Integration
 geyser:
+  # Geyser data folder (relative to the plugins folder). Auto-detected if missing.
+  folder: "Geyser-Spigot"
+
   # Automatically place converted files in Geyser directories
   auto-place-files: true
 

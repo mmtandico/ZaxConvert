@@ -29,8 +29,6 @@ public class ZaxConvert extends JavaPlugin implements CommandExecutor, TabComple
         // Register command executors
         getCommand("zc").setExecutor(commandExecutor);
         getCommand("zc").setTabCompleter(this);
-        getCommand("zinv").setExecutor(commandExecutor);
-        getCommand("zinv").setTabCompleter(this);
 
         getLogger().info("ZaxConvert has been enabled!");
         getLogger().info("Supports Nexo, ItemsAdder, and Oraxen plugin conversions");

@@ -1,0 +1,31 @@
+name: ZaxConvert
+version: 1.0.0
+main: com.zaxconvert.ZaxConvert
+api-version: "1.21"
+description: Converts Nexo, ItemsAdder and Oraxen resource packs to Bedrock (Geyser) format
+author: ZaxConvert Team
+website: https://zaxconvert.com
+softdepend: [Nexo, ItemsAdder, Oraxen, Geyser-Spigot]
+
+commands:
+  zc:
+    description: Scan providers and convert their packs for Geyser
+    usage: /zc [convert <path>|reload|help|info|setup]
+    aliases: [zinv]
+
+permissions:
+  zaxconvert.use:
+    description: Base permission to use ZaxConvert commands
+    default: op
+  zaxconvert.convert:
+    description: Allows use of /zc
+    default: op
+  zaxconvert.reload:
+    description: Allows use of /zc reload
+    default: op
+  zaxconvert.info:
+    description: Allows use of /zc info
+    default: op
+  zaxconvert.setup:
+    description: Allows use of /zc setup
+    default: op

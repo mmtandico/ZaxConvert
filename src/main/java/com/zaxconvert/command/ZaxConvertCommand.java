@@ -2,6 +2,7 @@ package com.zaxconvert.command;
 
 import com.zaxconvert.ZaxConvert;
 import com.zaxconvert.conversion.ResourcePackConverter;
+import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
@@ -34,8 +35,7 @@ public class ZaxConvertCommand implements CommandExecutor {
         }
 
         if (args.length == 0) {
-            showHelp(sender);
-            return true;
+            return handleAutoConvert(sender);
         }
 
         String subcommand = args[0].toLowerCase();
@@ -59,44 +59,56 @@ public class ZaxConvertCommand implements CommandExecutor {
         }
     }
 
+    /** /zc: scan all providers (Nexo, ItemsAdder, Oraxen) and convert for Geyser. */
+    private boolean handleAutoConvert(CommandSender sender) {
+        if (!sender.hasPermission("zaxconvert.convert")) {
+            sender.sendMessage(ChatColor.RED + "You don't have permission to convert resource packs.");
+            return true;
+        }
+        sender.sendMessage(ChatColor.GOLD + "Scanning providers and converting packs...");
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () ->
+                report(sender, converter.convertAllProviders()));
+        return true;
+    }
+
     private boolean handleConvert(CommandSender sender, String[] args) {
         if (!sender.hasPermission("zaxconvert.convert")) {
             sender.sendMessage(ChatColor.RED + "You don't have permission to convert resource packs.");
             return true;
         }
 
-        // Parse arguments: /zc convert <resourcepack> [outputdir]
+        // /zc convert <resourcepack>
         if (args.length < 2) {
-            sender.sendMessage(ChatColor.YELLOW + "Usage: /zc convert <resourcepack> [outputdir]");
+            sender.sendMessage(ChatColor.YELLOW + "Usage: /zc convert <resourcepack>");
             sender.sendMessage(ChatColor.YELLOW + "  <resourcepack>: Path to Java resource pack (zip or folder)");
-            sender.sendMessage(ChatColor.YELLOW + "  [outputdir]: Optional output directory (defaults to Geyser packs folder)");
+            sender.sendMessage(ChatColor.YELLOW + "  Or just run /zc to auto-convert all providers.");
             return true;
         }
 
-        String resourcePackPath = args[1];
-        String outputDir = (args.length > 2) ? args[2] : getDefaultGeyserOutputDir();
-
-        sender.sendMessage(ChatColor.GOLD + "Starting resource pack conversion...");
-        sender.sendMessage(ChatColor.YELLOW + "Input: " + resourcePackPath);
-        sender.sendMessage(ChatColor.YELLOW + "Output: " + outputDir);
-
-        // Show plugin support status
-        showPluginSupportStatus(sender);
-
-        // Perform conversion
-        boolean success = converter.convertResourcePack(resourcePackPath, outputDir);
-
-        if (success) {
-            sender.sendMessage(ChatColor.GREEN + "Conversion completed successfully!");
-            sender.sendMessage(ChatColor.YELLOW + "Next steps:");
-            sender.sendMessage(ChatColor.YELLOW + "  1. Place generated files in Geyser's custom_mappings and packs folders");
-            sender.sendMessage(ChatColor.YELLOW + "  2. Restart your server");
-            sender.sendMessage(ChatColor.YELLOW + "  3. Bedrock players will now see your custom content");
-        } else {
-            sender.sendMessage(ChatColor.RED + "Conversion failed. Check the console for details.");
+        File pack = new File(args[1]);
+        if (!pack.exists()) {
+            sender.sendMessage(ChatColor.RED + "Pack not found: " + args[1]);
+            return true;
         }
-
+        String name = pack.getName().replaceAll("\\.zip$", "");
+        sender.sendMessage(ChatColor.GOLD + "Converting " + pack.getName() + "...");
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () ->
+                report(sender, java.util.Collections.singletonList(converter.convertPack(name, pack))));
         return true;
+    }
+
+    private void report(CommandSender sender, java.util.List<ResourcePackConverter.Result> results) {
+        boolean any = false;
+        for (ResourcePackConverter.Result r : results) {
+            ChatColor c = r.success ? ChatColor.GREEN : ChatColor.YELLOW;
+            sender.sendMessage(c + "[" + r.provider + "] " + r.message);
+            any |= r.success;
+        }
+        if (any) {
+            sender.sendMessage(ChatColor.GREEN + "Done! Restart the server (or Geyser) so Bedrock players get the new pack.");
+        } else {
+            sender.sendMessage(ChatColor.RED + "Nothing was converted.");
+        }
     }
 
     private boolean handleReload(CommandSender sender, String[] args) {

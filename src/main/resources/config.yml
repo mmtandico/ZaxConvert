@@ -1,0 +1,66 @@
+# ZaxConvert Configuration
+# This file manages settings for the Java to Bedrock resource pack conversion
+
+# General Settings
+general:
+  # Enable automatic backup of resource packs before conversion
+  backup-enabled: true
+
+  # Enable verbose logging during conversion
+  verbose-logging: false
+
+  # Default resource pack location (relative to server directory)
+  default-resource-pack: "plugins/ZaxConvert/resourcepacks/"
+
+  # Output directory for converted packs (relative to Geyser directory)
+  geyser-output-dir: "../Geyser/"
+
+# Plugin Support Settings
+plugin-support:
+  # Enable support for Nexo
+  nexo-enabled: true
+
+  # Enable support for ItemsAdder
+  itemsadder-enabled: true
+
+  # Enable support for Oraxen
+  oraxen-enabled: true
+
+  # Auto-detect and configure supported plugins
+  auto-configure-plugins: true
+
+# Conversion Settings
+conversion:
+  # Maximum file size for conversion (in MB)
+  max-file-size: 100
+
+  # Enable texture optimization during conversion
+  texture-optimization: true
+
+  # Preserve custom model data
+  preserve-custom-model-data: true
+
+  # Convert custom enchants and potions
+  convert-custom-effects: true
+
+# Geyser Integration
+geyser:
+  # Automatically place converted files in Geyser directories
+  auto-place-files: true
+
+  # Custom mappings folder name
+  custom-mappings-folder: "custom_mappings"
+
+  # Resource packs folder name
+  resource-packs-folder: "packs"
+
+  # Enable proxy mode support (for Velocity/BungeeCord)
+  proxy-mode-support: true
+
+# Advanced Settings
+advanced:
+  # Enable debug mode
+  debug-mode: false
+
+  # Enable experimental features
+  experimental-features: false

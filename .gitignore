@@ -1,0 +1,32 @@
+# Compiled class files
+target/
+bin/
+*.class
+
+# Package Files
+*.jar
+*.war
+*.ear
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Maven
+pom.xml.tag
+pom.xml.releaseBackUp
+pom.xml.nextRelease
+release.properties
+
+# Build artifacts
+/build
+/lib-plugins
